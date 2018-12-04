@@ -196,12 +196,13 @@ public:
     assert(N);
 
     SmallVector<Value *, 8> Sites;
-    for (auto *S : N->getAllocSites()) {
-      if (auto *GV = dyn_cast<const GlobalValue>(S))
+    for (auto &AS : N->getAllocSites()) {
+      llvm::Value *V = &AS.getAllocSite();
+      if (auto *GV = dyn_cast<const GlobalValue>(V))
         if (GV->isDeclaration())
           continue;
 
-      Sites.push_back(const_cast<Value *>(S));
+      Sites.push_back(V);
     }
 
     return Sites;
@@ -567,7 +568,7 @@ bool SimpleMemoryCheck::isInterestingAllocSite(Value *Ptr, int64_t LoadEnd,
   assert(Ptr);
   assert(Alloc);
   assert(LoadEnd > 0);
-
+  
   Optional<size_t> AllocSize = getAllocSize(Alloc);
   return AllocSize && size_t(LoadEnd) > *AllocSize;
 }
@@ -951,8 +952,13 @@ bool SimpleMemoryCheck::runOnModule(llvm::Module &M) {
           // noise.
           if (Check.InterestingAllocSites.empty() /*|| Check.Collapsed*/) {
             UninterestingMIs.push_back(I);
-            if (!PrintEmptyAS)
+            if (!PrintEmptyAS) {
+              static llvm::DenseSet<Value*> AllAs;
+              AllAs.insert(Check.OtherAllocSites.begin(), Check.OtherAllocSites.end());
+              // errs() << "All AS:\t" << AllAs.size() << "\n";
+
               continue;
+            }
           }
 
           CheckCandidates.emplace_back(std::move(Check));
