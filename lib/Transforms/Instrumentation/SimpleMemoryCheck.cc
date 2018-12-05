@@ -197,7 +197,7 @@ public:
 
     SmallVector<Value *, 8> Sites;
     for (auto &AS : N->getAllocSites()) {
-      llvm::Value *V = &AS.getAllocSite();
+      llvm::Value *V = &AS->getAllocSite();
       if (auto *GV = dyn_cast<const GlobalValue>(V))
         if (GV->isDeclaration())
           continue;
@@ -568,7 +568,7 @@ bool SimpleMemoryCheck::isInterestingAllocSite(Value *Ptr, int64_t LoadEnd,
   assert(Ptr);
   assert(Alloc);
   assert(LoadEnd > 0);
-  
+
   Optional<size_t> AllocSize = getAllocSize(Alloc);
   return AllocSize && size_t(LoadEnd) > *AllocSize;
 }

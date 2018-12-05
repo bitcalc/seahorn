@@ -207,8 +207,10 @@ public:
 
       if (const Value *AV = m_dsa->getAllocValue(TrackedAllocSite)) {
         auto const &s = c->getNode()->getAllocSites();
-        sea_dsa::DSAllocSite AV_AS(*AV);
-        return (std::find(s.begin(), s.end(), AV_AS) != s.end());
+        llvm::Optional<sea_dsa::DSAllocSite *> optAS
+          = c->getNode()->getGraph()->getAllocSiteOrNone(*AV);
+        return optAS.hasValue() &&
+               (std::find(s.begin(), s.end(), *optAS) != s.end());
       } else {
         errs() << "WARNING ABC: allocation site " << TrackedAllocSite
                << " not understood by Sea Dsa\n";
