@@ -19,6 +19,7 @@
 #include "llvm/Transforms/Utils/UnifyFunctionExitNodes.h"
 
 #include "avy/AvyDebug.h"
+#include "sea_dsa/AllocSite.hh"
 #include "sea_dsa/DsaAnalysis.hh"
 
 #define SMC_LOG(...) LOG("smc", __VA_ARGS__)
@@ -40,6 +41,11 @@ static llvm::cl::opt<bool>
     PrintEmptyAS("print-empty-alloc-sites",
                  llvm::cl::desc("Print empty allocation sites"),
                  llvm::cl::init(false));
+
+static llvm::cl::opt<bool> PrintAllocSiteCallPaths(
+    "print-alloc-site-call-paths",
+    llvm::cl::desc("Print call paths of allocation sites"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<unsigned> SMCAnalysisThreshold(
     "smc-check-threshold",
@@ -78,8 +84,8 @@ struct CheckContext {
   Value *Barrier = nullptr;
   bool Collapsed = false;
   size_t AccessedBytes = 0;
-  SmallVector<Value *, 8> InterestingAllocSites;
-  SmallVector<Value *, 8> OtherAllocSites;
+  SmallVector<sea_dsa::DSAllocSite *, 8> InterestingAllocSites;
+  SmallVector<sea_dsa::DSAllocSite *, 8> OtherAllocSites;
 
   void dump(llvm::raw_ostream &OS = llvm::errs()) {
     OS << "CheckContext : " << (F ? ValueToString(F) : "nullptr") << " {\n";
@@ -102,7 +108,8 @@ struct CheckContext {
 
     OS << "\n  InterestingAllocSites: {\n";
     unsigned i = 0;
-    for (auto *V : InterestingAllocSites) {
+    for (auto *AS : InterestingAllocSites) {
+      llvm::Value *V = &AS->getAllocSite();
       OS << "    " << (i++) << ": " << ValueToString(V);
 
       if (auto *I = dyn_cast<Instruction>(V))
@@ -110,11 +117,16 @@ struct CheckContext {
            << ValueToString(I->getParent()) << ")";
 
       OS << ",\n";
+
+      if (PrintAllocSiteCallPaths)
+        OS << "\t" << ValueToString(AS) << "\n";
     }
 
     unsigned Others = 0;
     OS << "  }  OtherAllocSites: {\n";
-    for (auto *V : OtherAllocSites) {
+    for (auto *AS : OtherAllocSites) {
+      llvm::Value *V = &AS->getAllocSite();
+
       OS << "    " << (i++) << ": " << ValueToString(V);
 
       if (auto *I = dyn_cast<Instruction>(V))
@@ -135,24 +147,34 @@ struct CheckContext {
   }
 
 private:
-  static llvm::StringRef ValueToString(llvm::Value *V) {
+  static std::string GetStr(llvm::Value *V) {
+    std::string Buff;
+    llvm::raw_string_ostream OS(Buff);
+    if (auto *F = dyn_cast<llvm::Function>(V))
+      OS << F->getName();
+    else if (auto *BB = dyn_cast<llvm::BasicBlock>(V))
+      OS << BB->getName();
+    else
+      V->print(OS);
+
+    OS.flush();
+    return Buff;
+  }
+
+  static std::string GetStr(sea_dsa::DSAllocSite *AS) {
+    std::string Buff;
+    llvm::raw_string_ostream OS(Buff);
+    AS->print(OS);
+    OS.flush();
+    return Buff;
+  }
+
+  template <typename T> static llvm::StringRef ValueToString(T *V) {
     assert(V);
-    static llvm::DenseMap<llvm::Value *, std::string> Cache;
+    static llvm::DenseMap<T *, std::string> Cache;
 
-    if (Cache.count(V) == 0) {
-      std::string Buff;
-      llvm::raw_string_ostream OS(Buff);
-      if (auto *F = dyn_cast<llvm::Function>(V))
-        OS << F->getName();
-      else if (auto *BB = dyn_cast<llvm::BasicBlock>(V))
-        OS << BB->getName();
-      else
-        V->print(OS);
-
-      OS.flush();
-      Cache[V] = Buff;
-    }
-
+    if (Cache.count(V) == 0)
+      Cache[V] = GetStr(V);
     return Cache[V];
   }
 };
@@ -189,20 +211,21 @@ public:
       : m_abc(abc),
         m_dsa(&this->m_abc->getAnalysis<sea_dsa::DsaInfoPass>().getDsaInfo()) {}
 
-  SmallVector<Value *, 8> getAllocSites(Value *V, const Function &F) {
+  SmallVector<sea_dsa::DSAllocSite *, 8> getAllocSites(Value *V,
+                                                       const Function &F) {
     auto *C = getCell(V, F);
     assert(C);
     auto *N = C->getNode();
     assert(N);
 
-    SmallVector<Value *, 8> Sites;
-    for (auto &AS : N->getAllocSites()) {
+    SmallVector<sea_dsa::DSAllocSite *, 8> Sites;
+    for (sea_dsa::DSAllocSite *AS : N->getAllocSites()) {
       llvm::Value *V = &AS->getAllocSite();
       if (auto *GV = dyn_cast<const GlobalValue>(V))
         if (GV->isDeclaration())
           continue;
 
-      Sites.push_back(V);
+      Sites.push_back(AS);
     }
 
     return Sites;
@@ -246,7 +269,8 @@ private:
       std::map<std::pair<Type *, Type *>, TypeSimilarity>;
   CheckContext getUnsafeCandidates(Instruction *Ptr, Function &F,
                                    TypeSimilarityCache &TSC);
-  bool isInterestingAllocSite(Value *Inst, int64_t LoadEnd, Value *Alloc);
+  bool isInterestingAllocSite(Value *Inst, int64_t LoadEnd,
+                              sea_dsa::DSAllocSite *Alloc);
 
   void emitGlobalInstrumentation(CheckContext &Candidate, size_t AllocId);
   void emitMemoryInstInstrumentation(CheckContext &Candidate);
@@ -514,12 +538,13 @@ CheckContext SimpleMemoryCheck::getUnsafeCandidates(Instruction *Inst,
 
   assert(Origin.Ptr);
 
-  for (Value *AS : m_SDSA->getAllocSites(Origin.Ptr, F)) {
+  for (sea_dsa::DSAllocSite *AS : m_SDSA->getAllocSites(Origin.Ptr, F)) {
     bool Interesting = isInterestingAllocSite(Origin.Ptr, LastRead, AS);
+    llvm::Value *ASVal = &AS->getAllocSite();
 
     if (Interesting /*&& Check.Collapsed*/) {
       auto *BarrierPtrTy = Check.Barrier->getType();
-      auto *AllocPtrTy = AS->getType();
+      auto *AllocPtrTy = ASVal->getType();
       if (BarrierPtrTy->isPointerTy() && AllocPtrTy->isPointerTy()) {
         auto *BarrierTy = BarrierPtrTy->getPointerElementType();
         auto *AllocTy = AllocPtrTy->getPointerElementType();
@@ -533,7 +558,7 @@ CheckContext SimpleMemoryCheck::getUnsafeCandidates(Instruction *Inst,
               Interesting = false;
 
         // Heap alloc tends to return i8* instead of precise type.
-        if (!isa<CallInst>(AS) && !isa<InvokeInst>(AS)) {
+        if (!isa<CallInst>(ASVal) && !isa<InvokeInst>(ASVal)) {
           if (TSC.count({BarrierTy, AllocTy}) == 0)
             TSC[{BarrierTy, AllocTy}] =
                 TypeSimilarity(BarrierTy, AllocTy, m_Ctx, m_DL);
@@ -564,12 +589,12 @@ CheckContext SimpleMemoryCheck::getUnsafeCandidates(Instruction *Inst,
 }
 
 bool SimpleMemoryCheck::isInterestingAllocSite(Value *Ptr, int64_t LoadEnd,
-                                               Value *Alloc) {
+                                               sea_dsa::DSAllocSite *Alloc) {
   assert(Ptr);
   assert(Alloc);
   assert(LoadEnd > 0);
 
-  Optional<size_t> AllocSize = getAllocSize(Alloc);
+  Optional<size_t> AllocSize = getAllocSize(&Alloc->getAllocSite());
   return AllocSize && size_t(LoadEnd) > *AllocSize;
 }
 
@@ -710,15 +735,16 @@ void SimpleMemoryCheck::emitGlobalInstrumentation(CheckContext &Candidate,
   createAssume(Cmp2, Main, IRB);
   CreateStore(IRB, NDPtrEnd, m_trackedEnd, m_DL);
 
-  auto *TrackedAlloc = Candidate.InterestingAllocSites[AllocId];
-  if (auto *TrackedGV = dyn_cast<GlobalVariable>(TrackedAlloc)) {
+  sea_dsa::DSAllocSite *TrackedAlloc = Candidate.InterestingAllocSites[AllocId];
+  llvm::Value *TrackedAllocV = &TrackedAlloc->getAllocSite();
+  if (auto *TrackedGV = dyn_cast<GlobalVariable>(TrackedAllocV)) {
     assert(!TrackedGV->isDeclaration());
 
     auto *I8GV = IRB.CreateBitCast(TrackedGV, GetI8PtrTy(*m_Ctx));
     auto *GlobalIsBegin = IRB.CreateICmpEQ(I8GV, NDPtrBegin, "global.is.begin");
     createAssume(GlobalIsBegin, Main, IRB);
 
-    Optional<size_t> AllocSize = getAllocSize(TrackedAlloc);
+    Optional<size_t> AllocSize = getAllocSize(TrackedAllocV);
     assert(AllocSize);
 
     auto *GlobalEnd = IRB.CreateGEP(
@@ -744,18 +770,17 @@ void SimpleMemoryCheck::emitGlobalInstrumentation(CheckContext &Candidate,
     createAssume(CmpGV, Main, IRB);
   };
 
-  for (auto *AV : Candidate.InterestingAllocSites) {
-    if (AV == TrackedAlloc)
+  for (sea_dsa::DSAllocSite *AS : Candidate.InterestingAllocSites) {
+    if (AS == TrackedAlloc)
       continue;
 
-    EmitOtherGVAssume(AV);
+    EmitOtherGVAssume(&AS->getAllocSite());
   }
 
-  for (auto *AV : Candidate.OtherAllocSites)
-    EmitOtherGVAssume(AV);
+  for (sea_dsa::DSAllocSite *AS : Candidate.OtherAllocSites)
+    EmitOtherGVAssume(&AS->getAllocSite());
 
-  // FIXME: undefined symbols llvm::Value::dump() while porting to 5.0
-  //SMC_LOG(NDPtrBegin->getParent()->dump());
+  SMC_LOG(NDPtrBegin->getParent()->print(errs()); errs() << "\n");
 }
 
 /**
@@ -800,7 +825,8 @@ void SimpleMemoryCheck::emitAllocSiteInstrumentation(CheckContext &Candidate,
                                                      size_t AllocId) {
   assert(Candidate.InterestingAllocSites.size() > AllocId);
 
-  Value *const Alloc = Candidate.InterestingAllocSites[AllocId];
+  sea_dsa::DSAllocSite *const AS = Candidate.InterestingAllocSites[AllocId];
+  Value *const Alloc = &AS->getAllocSite();
   IRBuilder<> IRB(*m_Ctx);
 
   // GlobalVariables are handles in emitGlobalInstrumentation.
@@ -878,12 +904,12 @@ void SimpleMemoryCheck::emitAllocSiteInstrumentation(CheckContext &Candidate,
     if (i == AllocId)
       continue;
 
-    auto *AV = Candidate.InterestingAllocSites[i];
+    auto *AV = &Candidate.InterestingAllocSites[i]->getAllocSite();
     InstrumentRemainingSite(AV);
   }
 
-  for (auto *AV : Candidate.OtherAllocSites)
-    InstrumentRemainingSite(AV);
+  for (sea_dsa::DSAllocSite *AS : Candidate.OtherAllocSites)
+    InstrumentRemainingSite(&AS->getAllocSite());
 }
 
 bool SimpleMemoryCheck::runOnModule(llvm::Module &M) {
@@ -954,9 +980,9 @@ bool SimpleMemoryCheck::runOnModule(llvm::Module &M) {
             UninterestingMIs.push_back(I);
             if (!PrintEmptyAS) {
               static llvm::DenseSet<Value*> AllAs;
-              AllAs.insert(Check.OtherAllocSites.begin(), Check.OtherAllocSites.end());
+              for (sea_dsa::DSAllocSite *AS : Check.OtherAllocSites)
+                AllAs.insert(&AS->getAllocSite());
               // errs() << "All AS:\t" << AllAs.size() << "\n";
-
               continue;
             }
           }
@@ -1039,12 +1065,17 @@ void SimpleMemoryCheck::getAnalysisUsage(llvm::AnalysisUsage &AU) const {
   // AU.addRequired<ufo::NameValues> ();
 }
 
+llvm::Value *ASToValue(llvm::Value *V) { return V; }
+llvm::Value *ASToValue(sea_dsa::DSAllocSite *AS) { return &AS->getAllocSite(); }
+
 template <typename ValTy, typename Container>
 static size_t CountOfType(const Container &C) {
   size_t Res = 0;
-  for (auto *V : C)
+  for (auto *AS : C) {
+    llvm::Value *V = ASToValue(AS);
     if (isa<ValTy>(V))
       ++Res;
+  }
 
   return Res;
 };
@@ -1071,8 +1102,8 @@ struct SizeStats {
   static SizeStats Collect(SimpleMemoryCheck &SMC, Container &C) {
     SizeStats Stats;
 
-    for (auto *V : C) {
-      Optional<size_t> Size = SMC.getAllocSize(V);
+    for (sea_dsa::DSAllocSite *AS : C) {
+      Optional<size_t> Size = SMC.getAllocSize(&AS->getAllocSite());
       assert(Size);
 
       ++Stats.N;
@@ -1113,14 +1144,14 @@ void SimpleMemoryCheck::printStats(
     AllInstructions.insert(Check.MI);
 
     TotalSimple += Check.InterestingAllocSites.size();
-    for (auto *AS : Check.InterestingAllocSites) {
-      AllAllocSites.insert(AS);
-      AllInterestingAllocSites.insert(AS);
+    for (sea_dsa::DSAllocSite *AS : Check.InterestingAllocSites) {
+      AllAllocSites.insert(&AS->getAllocSite());
+      AllInterestingAllocSites.insert(&AS->getAllocSite());
     }
 
-    for (auto *AS : Check.OtherAllocSites) {
-      AllAllocSites.insert(AS);
-      AllOtherAllocSites.insert(AS);
+    for (sea_dsa::DSAllocSite *AS : Check.OtherAllocSites) {
+      AllAllocSites.insert(&AS->getAllocSite());
+      AllOtherAllocSites.insert(&AS->getAllocSite());
     }
   }
 
@@ -1162,15 +1193,16 @@ void SimpleMemoryCheck::printStats(
     size_t DifficultHeapCnt = 0;
 
     for (auto *AS : C.OtherAllocSites) {
-      if (getAllocSize(AS))
+      Value *V = &AS->getAllocSite();
+      if (getAllocSize(V))
         continue;
-      if (auto *GV = dyn_cast<GlobalVariable>(AS)) {
+      if (auto *GV = dyn_cast<GlobalVariable>(V)) {
         if (!GV->hasInternalLinkage()) {
           ++DifficultGlobalCnt;
         }
-      } else if (isa<AllocaInst>(AS))
+      } else if (isa<AllocaInst>(V))
         ++DifficultStackCnt;
-      else if (isa<CallInst>(AS) || isa<InvokeInst>(AS))
+      else if (isa<CallInst>(V) || isa<InvokeInst>(V))
         ++DifficultHeapCnt;
     }
 
