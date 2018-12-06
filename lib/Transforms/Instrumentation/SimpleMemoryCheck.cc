@@ -42,11 +42,6 @@ static llvm::cl::opt<bool>
                  llvm::cl::desc("Print empty allocation sites"),
                  llvm::cl::init(false));
 
-static llvm::cl::opt<bool> PrintAllocSiteCallPaths(
-    "print-alloc-site-call-paths",
-    llvm::cl::desc("Print call paths of allocation sites"),
-    llvm::cl::init(false));
-
 static llvm::cl::opt<unsigned> SMCAnalysisThreshold(
     "smc-check-threshold",
     llvm::cl::desc("Max no. of analyzed memory instructions"),
@@ -118,7 +113,7 @@ struct CheckContext {
 
       OS << ",\n";
 
-      if (PrintAllocSiteCallPaths)
+      if (AS->hasCallPaths())
         OS << "\t" << ValueToString(AS) << "\n";
     }
 
